@@ -5,15 +5,15 @@ import urllib.request
 import urllib.parse
 import os
 import logging
-import struct
 import random
-import time
 import tkinter as tk
 from tkinter import PhotoImage, Label
 from PIL import Image, ImageTk
 import io
-import requests
+import time
+import threading
 from serial_module import SerialReader
+import sys
 
 # Initialize the SerialReader
 serial_reader = SerialReader('/dev/ttyACM0', 9600)
@@ -41,7 +41,6 @@ def setup_logging():
     # Enable WebSocket trace, specifying the logger to use
     websocket.enableTrace(True, handler=fh)
 
-
 server_address = "artnet.itu.dk:8100"
 client_id = str(uuid.uuid4())
 
@@ -49,11 +48,18 @@ client_id = str(uuid.uuid4())
 def create_image_window():
     window = tk.Tk()
     window.title("Received Image")
+    # Check if the script was started with --fullscreen argument
+    if '--fullscreen' in sys.argv:
+        window.attributes('-fullscreen', True)  # Set the window to fullscreen
+        window.configure(background='black')  # Set background to black
+    else:
+        window.configure(background='black')  # Set background to black even if not fullscreen
+
     # Initial dummy image to initialize the label
     img = PhotoImage(width=1, height=1)
-    label = Label(window, image=img)
+    label = Label(window, image=img, bg='black')  # Ensure label background is also black
     label.image = img  # Keep a reference so it's not garbage collected
-    label.pack()
+    label.pack(expand=True)  # Center the content in the window
     return window, label
 
 def queue_prompt(prompt):
@@ -124,15 +130,15 @@ def get_images(ws, prompt, window, label):
             except Exception as e:
                 logging.error(f"Error processing binary message: {e}")
 
-
 workflow_path = os.path.join(os.path.dirname(__file__), 'workflow_api-sdxl-solarpunk.json')
+# workflow_path = os.path.join(os.path.dirname(__file__), 'workflow_api_ws_solarpunk_sdxlturbo.json')
 with open(workflow_path, 'r') as file:
     prompt_text = file.read()
 
 prompt = json.loads(prompt_text)
 
 # Setup logging (uncomment if logging is desired)
-setup_logging()
+# setup_logging()
 
 # Initialize Tkinter window and label for image display
 window, label = create_image_window()
@@ -141,40 +147,76 @@ window, label = create_image_window()
 ws = websocket.WebSocket()
 ws.connect("ws://{}/ws?clientId={}".format(server_address, client_id))
 
-# Function to handle key press events
-def on_key_press(event):
-    global execution_complete
-    if execution_complete:
-        # Only process the keypress if the previous has been completed
-        process_key_press
-        window.after(100, lambda: process_key_press(event))
-    else:
-        print("Execution in progress. Ignoring key press.")
-    # Delay processing the new key press to give time for the interrupt to be processed
+def update_images_based_on_city_change():
+    global prompt_text
+    current_city = None  # Track the current city to detect changes
 
-def process_key_press(event):
-    city = None
-    if event.char == 's':  # Stockholm
-        city = "Stockholm"
-    elif event.char == 'o':  # Oslo
-        city = "Oslo"
-    elif event.char == 'c':  # Copenhagen
-        city = "Copenhagen"
-    elif event.char == 'b':  # Budapest
-        city = "Budapest"
-    elif event.char == 'h':  # Helsinki
-        city = "Helsinki"
+    # Define the ranges and corresponding cities
+    city_ranges = [
+        (208, 250, "Malmo"),
+        (251, 290, "Ostrowa"),
+        (291, 318, "Danmark"),
+        (319, 355, "Luxembourg"),
+        (356, 375, "Helsingborg"),  # Adjusted start to 356 to avoid overlap with Luxembourg
+        (376, 404, "Lille"),
+        (405, 437, "Prague"),
+        (438, 461, "Strasbourg"),
+        (462, 496, "Light Pro"),
+        (497, 540, "Strasbourg I."),
+        (541, 568, "Bratislava"),
+        (569, 594, "Home Service"),
+        (595, 622, "Hilversum II"),
+        (623, 668, "Brussel II"),
+        (669, 699, "Milano"),
+        (700, 722, "Bucharest"),
+        (723, 729, "Rom II"),
+        (730, 740, "Nancy"),
+        (741, 750, "Home Service"),  # Note: "Home Service" is repeated; consider renaming for clarity
+        (751, 789, "Sottens"),
+        (790, 810, "Hilversum I"),
+        (811, 918, "Third Program"),
+        (919, 940, "Bruxelles"),
+        (941, 954, "Berlin III"),
+        (955, 970, "Lyon I"),
+        (971, 1000, "Wien II"),
+        (1001, 1019, "Stuttgart")
+    ]
 
-    if city:
-        prompt_text = f"sustainable future {city} in the style of Syd Mead"
-        prompt["6"]["inputs"]["text"] = prompt_text
-        prompt["3"]["inputs"]["seed"] = random.randint(10**9, 10**10)
-        prompt["3"]["inputs"]["steps"] = 10
-        print(f"Getting images for: {prompt_text} with seed {prompt['3']['inputs']['seed']}")
-        get_images(ws, prompt, window, label)
+    while True:
+        smoothed_values = serial_reader.get_latest_smoothed_values()
+        if smoothed_values:
+            last_value = smoothed_values[-1]
+            new_city = None
 
-# Bind key press events to the window
-window.bind('<KeyPress>', on_key_press)
+            # Determine the new city based on the last value
+            for start, end, city in city_ranges:
+                if start <= last_value <= end:
+                    new_city = city
+                    break  # Exit loop once the correct range is found
+
+            # Check if the city has changed (ignore if new_city is None which means value is out of range)
+            if new_city and new_city != current_city:
+                current_city = new_city  # Update the current city
+                
+                # Update the prompt with the new city
+                # prompt_text = f"sustainable future {current_city} in the style of Syd Mead."
+                prompt_text = f"futuristic sustainable future {current_city}, solarpunk streetscape parks waterfront golden hour colorful in the style of Gropius, Robert McCall, Syd Mead and George Birrell"
+                prompt["6"]["inputs"]["text"] = prompt_text
+                prompt["3"]["inputs"]["seed"] = random.randint(10**9, 10**10)
+                prompt["3"]["inputs"]["steps"] = 10
+
+                print(f"Getting images for: {prompt_text} with seed {prompt['3']['inputs']['seed']}")
+
+                # Call the image generation function
+                get_images(ws, prompt, window, label)
+
+        time.sleep(1)  # Wait a bit before checking again to reduce load
+
+# Replace or modify the existing thread start with this updated function call
+thread = threading.Thread(target=update_images_based_on_city_change)
+thread.daemon = True
+thread.start()
+
 
 # Start the Tkinter event loop
 window.mainloop()
